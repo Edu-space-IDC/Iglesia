@@ -160,3 +160,54 @@ Estado
 ```
 
 Las respuestas publicas entran con ese campo vacio y el panel admin lo normaliza usando el primer estado activo.
+
+## 11. Deploy en Vercel
+
+Este proyecto ya puede desplegarse en un solo proyecto de Vercel:
+
+- sitio publico: `/`
+- panel admin: `/admin.html`
+- API admin: `/api/admin/...`
+
+### Archivos importantes
+
+- la UI del admin se construye con Vite
+- la API de Vercel vive en `api/admin/[...route].mjs`
+- la logica compartida del backend sigue en `server/admin-server.mjs`
+
+### Variables de entorno en Vercel
+
+Define estas variables en `Project Settings > Environment Variables`:
+
+```text
+GOOGLE_SHEETS_SPREADSHEET_ID=...
+GOOGLE_SHEETS_RESPONSES_SHEET_NAME=Formulario Web - la barca
+GOOGLE_SERVICE_ACCOUNT_EMAIL=...
+GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY=...
+ADMIN_JWT_SECRET=pon-aqui-un-secret-largo-y-privado
+ADMIN_ALLOWED_ORIGINS=https://tu-dominio.com,https://tu-proyecto.vercel.app
+```
+
+Notas:
+
+- `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY` debe pegarse completa
+- si tiene saltos de linea, Vercel los maneja bien como variable multilina
+- `ADMIN_JWT_SECRET` es obligatorio en produccion
+- si frontend y API viven en el mismo proyecto de Vercel, no hace falta definir `VITE_ADMIN_API_URL`
+
+### Deploy
+
+1. Sube el repo a GitHub.
+2. Importa el repo en Vercel.
+3. Deja que Vercel ejecute el build del proyecto.
+4. Abre la URL del deploy y entra a:
+
+```text
+https://tu-proyecto.vercel.app/admin.html
+```
+
+### Antes de abrirlo al publico
+
+- cambia la contrasena inicial `1234`
+- confirma que la hoja este compartida con el service account
+- verifica que `Google Sheets API` este activada en el proyecto del service account

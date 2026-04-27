@@ -1,11 +1,13 @@
 import { createServer } from 'node:http';
+import { Readable } from 'node:stream';
 import { promises as fs, readFileSync } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { pathToFileURL } from 'node:url';
 import {
+  createHmac,
   pbkdf2Sync,
   randomBytes,
-  randomUUID,
   timingSafeEqual,
 } from 'node:crypto';
 import { google } from 'googleapis';
@@ -53,8 +55,8 @@ const DEFAULT_ADMIN_ACCOUNT = {
   password: '1234',
 };
 const SESSION_TTL_MS = 1000 * 60 * 60 * 12;
+const SESSION_TTL_SECONDS = SESSION_TTL_MS / 1000;
 const API_PREFIX = '/api/admin';
-const sessions = new Map();
 let runtimePromise = null;
 let spreadsheetSetupPromise = null;
 
@@ -62,7 +64,7 @@ loadEnvironmentFile('.env.admin');
 
 const config = {
   host: process.env.ADMIN_SERVER_HOST || '127.0.0.1',
-  port: Number.parseInt(process.env.ADMIN_SERVER_PORT || '8787', 10),
+  port: Number.parseInt(process.env.ADMIN_SERVER_PORT || process.env.PORT || '8787', 10),
   allowedOrigins: (process.env.ADMIN_ALLOWED_ORIGINS ||
     'http://127.0.0.1:5173,http://localhost:5173').split(',').map((origin) => origin.trim()).filter(Boolean),
   spreadsheetId: process.env.GOOGLE_SHEETS_SPREADSHEET_ID || DEFAULT_SPREADSHEET_ID,
@@ -71,36 +73,28 @@ const config = {
   googleServiceAccountFile:
     process.env.GOOGLE_SERVICE_ACCOUNT_FILE || 'server/credentials/google-service-account.json',
   googleServiceAccountEmail: getConfiguredServiceAccountEmail(),
+  jwtSecret: getSessionSecret(),
 };
 
-const server = createServer(async (request, response) => {
-  setCorsHeaders(request, response);
-
+export async function handleAdminRequest(request) {
   if (request.method === 'OPTIONS') {
-    response.writeHead(204);
-    response.end();
-    return;
+    return withCorsHeaders(request, new Response(null, { status: 204 }));
   }
 
-  const baseUrl = `http://${request.headers.host || `${config.host}:${config.port}`}`;
-  const url = new URL(request.url || '/', baseUrl);
+  const url = new URL(request.url);
   const pathname = normalizePathname(url.pathname);
 
   if (!pathname.startsWith(API_PREFIX)) {
-    response.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
-    response.end(
-      JSON.stringify({
-        ok: false,
-        message: 'Ruta no encontrada.',
-      }),
-    );
-    return;
+    return sendJson(request, 404, {
+      ok: false,
+      message: 'Ruta no encontrada.',
+    });
   }
 
   try {
     if (pathname === `${API_PREFIX}/public-config` && request.method === 'GET') {
       const readiness = await getSetupReadiness();
-      return sendJson(response, 200, {
+      return sendJson(request, 200, {
         ok: true,
         ready: readiness.ready,
         missing: readiness.missing,
@@ -123,7 +117,7 @@ const server = createServer(async (request, response) => {
       const password = normalizeString(body.password);
 
       if (!username || !password) {
-        return sendJson(response, 400, {
+        return sendJson(request, 400, {
           ok: false,
           message: 'Ingresa tu usuario y contrasena.',
         });
@@ -138,14 +132,14 @@ const server = createServer(async (request, response) => {
       const isPasswordValid = verifyPassword(password, account.passwordHash);
 
       if (!isUsernameValid || !isPasswordValid) {
-        return sendJson(response, 401, {
+        return sendJson(request, 401, {
           ok: false,
           message: 'Usuario o contrasena incorrectos.',
         });
       }
 
       const token = createSessionToken(account);
-      return sendJson(response, 200, {
+      return sendJson(request, 200, {
         ok: true,
         token,
         profile: toProfile(account),
@@ -153,22 +147,17 @@ const server = createServer(async (request, response) => {
     }
 
     if (pathname === `${API_PREFIX}/logout` && request.method === 'POST') {
-      const session = getSessionFromRequest(request);
-      if (session) {
-        sessions.delete(session.token);
-      }
-
-      return sendJson(response, 200, {
+      return sendJson(request, 200, {
         ok: true,
       });
     }
 
+    requireSession(request);
     const runtime = await getRuntime();
-    const session = requireSession(request);
 
     if (pathname === `${API_PREFIX}/session` && request.method === 'GET') {
       const account = await readAdminAccount(runtime);
-      return sendJson(response, 200, {
+      return sendJson(request, 200, {
         ok: true,
         profile: toProfile(account),
       });
@@ -176,7 +165,7 @@ const server = createServer(async (request, response) => {
 
     if (pathname === `${API_PREFIX}/bootstrap` && request.method === 'GET') {
       const data = await loadBootstrapData(runtime);
-      return sendJson(response, 200, {
+      return sendJson(request, 200, {
         ok: true,
         ...data,
       });
@@ -184,7 +173,7 @@ const server = createServer(async (request, response) => {
 
     if (pathname === `${API_PREFIX}/records` && request.method === 'GET') {
       const data = await loadBootstrapData(runtime);
-      return sendJson(response, 200, {
+      return sendJson(request, 200, {
         ok: true,
         records: data.records,
         statuses: data.statuses,
@@ -193,20 +182,18 @@ const server = createServer(async (request, response) => {
 
     if (pathname === `${API_PREFIX}/records/export` && request.method === 'GET') {
       const exportResult = await buildRecordsWorkbook(runtime);
-      response.writeHead(200, {
+      return sendBinary(request, 200, exportResult.buffer, {
         'Content-Type':
           'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         'Content-Disposition': `attachment; filename="${exportResult.filename}"`,
         'Cache-Control': 'no-store',
       });
-      response.end(exportResult.buffer);
-      return;
     }
 
     if (pathname === `${API_PREFIX}/records` && request.method === 'POST') {
       const body = await readJsonBody(request);
       const record = await createRecord(runtime, body);
-      return sendJson(response, 201, {
+      return sendJson(request, 201, {
         ok: true,
         record,
       });
@@ -215,7 +202,7 @@ const server = createServer(async (request, response) => {
     if (pathname === `${API_PREFIX}/statuses` && request.method === 'PUT') {
       const body = await readJsonBody(request);
       const statuses = await saveStatuses(runtime, body.statuses || []);
-      return sendJson(response, 200, {
+      return sendJson(request, 200, {
         ok: true,
         statuses,
       });
@@ -224,8 +211,7 @@ const server = createServer(async (request, response) => {
     if (pathname === `${API_PREFIX}/account` && request.method === 'PUT') {
       const body = await readJsonBody(request);
       const updatedAccount = await updateAdminAccount(runtime, body);
-      session.username = normalizeString(updatedAccount.username).toLowerCase();
-      return sendJson(response, 200, {
+      return sendJson(request, 200, {
         ok: true,
         profile: toProfile(updatedAccount),
       });
@@ -236,7 +222,7 @@ const server = createServer(async (request, response) => {
       const body = await readJsonBody(request);
       const sheetRow = Number.parseInt(recordMatch[1], 10);
       const record = await updateRecord(runtime, sheetRow, body);
-      return sendJson(response, 200, {
+      return sendJson(request, 200, {
         ok: true,
         record,
       });
@@ -245,25 +231,46 @@ const server = createServer(async (request, response) => {
     if (recordMatch && request.method === 'DELETE') {
       const sheetRow = Number.parseInt(recordMatch[1], 10);
       await deleteRecord(runtime, sheetRow);
-      return sendJson(response, 200, {
+      return sendJson(request, 200, {
         ok: true,
       });
     }
 
-    return sendJson(response, 404, {
+    return sendJson(request, 404, {
       ok: false,
       message: 'Ruta no encontrada.',
     });
   } catch (error) {
-    return handleServerError(response, error);
+    return handleServerError(request, error);
+  }
+}
+
+export async function handleNodeAdminRequest(nodeRequest, nodeResponse) {
+  const request = await createWebRequestFromNodeRequest(nodeRequest);
+  const response = await handleAdminRequest(request);
+  await writeWebResponseToNodeResponse(nodeResponse, response);
+}
+
+const server = createServer(async (nodeRequest, nodeResponse) => {
+  try {
+    await handleNodeAdminRequest(nodeRequest, nodeResponse);
+  } catch (error) {
+    const fallbackRequest = new Request(buildRequestUrlFromNodeRequest(nodeRequest), {
+      method: nodeRequest.method || 'GET',
+      headers: nodeRequest.headers,
+    });
+    const fallbackResponse = handleServerError(fallbackRequest, error);
+    await writeWebResponseToNodeResponse(nodeResponse, fallbackResponse);
   }
 });
 
-server.listen(config.port, config.host, () => {
-  console.log(
-    `[admin-server] escuchando en http://${config.host}:${config.port}${API_PREFIX}/public-config`,
-  );
-});
+if (isExecutedDirectly()) {
+  server.listen(config.port, config.host, () => {
+    console.log(
+      `[admin-server] escuchando en http://${config.host}:${config.port}${API_PREFIX}/public-config`,
+    );
+  });
+}
 
 function normalizePathname(pathname) {
   if (!pathname) {
@@ -275,6 +282,74 @@ function normalizePathname(pathname) {
   }
 
   return pathname;
+}
+
+function isExecutedDirectly() {
+  const entryPath = process.argv[1];
+  if (!entryPath) {
+    return false;
+  }
+
+  return pathToFileURL(path.resolve(entryPath)).href === import.meta.url;
+}
+
+function buildRequestUrlFromNodeRequest(nodeRequest) {
+  const forwardedHost = normalizeString(nodeRequest.headers['x-forwarded-host']);
+  const requestHost =
+    forwardedHost ||
+    normalizeString(nodeRequest.headers.host) ||
+    `${config.host}:${config.port}`;
+  const protocol = normalizeString(nodeRequest.headers['x-forwarded-proto']) || 'http';
+  const pathname = normalizeString(nodeRequest.url) || '/';
+  return `${protocol}://${requestHost}${pathname}`;
+}
+
+async function createWebRequestFromNodeRequest(nodeRequest) {
+  const method = normalizeString(nodeRequest.method).toUpperCase() || 'GET';
+  const headers = new Headers();
+
+  Object.entries(nodeRequest.headers).forEach(([key, value]) => {
+    if (Array.isArray(value)) {
+      value.forEach((item) => {
+        if (item !== undefined) {
+          headers.append(key, String(item));
+        }
+      });
+      return;
+    }
+
+    if (value !== undefined) {
+      headers.set(key, String(value));
+    }
+  });
+
+  const init = {
+    method,
+    headers,
+  };
+
+  if (method !== 'GET' && method !== 'HEAD') {
+    init.body = Readable.toWeb(nodeRequest);
+    init.duplex = 'half';
+  }
+
+  return new Request(buildRequestUrlFromNodeRequest(nodeRequest), init);
+}
+
+async function writeWebResponseToNodeResponse(nodeResponse, response) {
+  nodeResponse.statusCode = response.status;
+
+  response.headers.forEach((value, key) => {
+    nodeResponse.setHeader(key, value);
+  });
+
+  if (!response.body) {
+    nodeResponse.end();
+    return;
+  }
+
+  const body = Buffer.from(await response.arrayBuffer());
+  nodeResponse.end(body);
 }
 
 function loadEnvironmentFile(relativeFilePath) {
@@ -318,6 +393,12 @@ async function getSetupReadiness() {
   if (!hasEnvCredentials && !hasServiceAccountFile) {
     missing.push(
       `Crea ${config.googleServiceAccountFile} con la llave del service account o define GOOGLE_SERVICE_ACCOUNT_EMAIL y GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY.`,
+    );
+  }
+
+  if (isProductionRuntime() && !config.jwtSecret) {
+    missing.push(
+      'Define ADMIN_JWT_SECRET en tu entorno de produccion para firmar las sesiones del panel admin.',
     );
   }
 
@@ -959,21 +1040,16 @@ function toProfile(account) {
 }
 
 function createSessionToken(account) {
-  pruneExpiredSessions();
-
-  const token = randomUUID();
-  sessions.set(token, {
-    token,
-    username: normalizeString(account.username).toLowerCase(),
-    expiresAt: Date.now() + SESSION_TTL_MS,
+  const issuedAt = Math.floor(Date.now() / 1000);
+  return signSessionToken({
+    sub: normalizeString(account.username).toLowerCase(),
+    iat: issuedAt,
+    exp: issuedAt + SESSION_TTL_SECONDS,
   });
-
-  return token;
 }
 
 function getSessionFromRequest(request) {
-  pruneExpiredSessions();
-  const authorizationHeader = request.headers.authorization || '';
+  const authorizationHeader = getRequestHeader(request, 'authorization');
   const match = authorizationHeader.match(/^Bearer\s+(.+)$/iu);
 
   if (!match) {
@@ -981,17 +1057,16 @@ function getSessionFromRequest(request) {
   }
 
   const token = match[1].trim();
-  const session = sessions.get(token);
-  if (!session) {
+  const payload = verifySessionToken(token);
+  if (!payload) {
     return null;
   }
 
-  if (session.expiresAt < Date.now()) {
-    sessions.delete(token);
-    return null;
-  }
-
-  return session;
+  return {
+    token,
+    username: normalizeString(payload.sub).toLowerCase(),
+    expiresAt: Number(payload.exp || 0) * 1000,
+  };
 }
 
 function requireSession(request) {
@@ -1003,13 +1078,71 @@ function requireSession(request) {
   return session;
 }
 
-function pruneExpiredSessions() {
-  const now = Date.now();
-  sessions.forEach((session, token) => {
-    if (session.expiresAt < now) {
-      sessions.delete(token);
+function signSessionToken(payload) {
+  const header = {
+    alg: 'HS256',
+    typ: 'JWT',
+  };
+  const encodedHeader = encodeBase64Url(JSON.stringify(header));
+  const encodedPayload = encodeBase64Url(JSON.stringify(payload));
+  const signature = createHmac('sha256', config.jwtSecret)
+    .update(`${encodedHeader}.${encodedPayload}`)
+    .digest('base64url');
+
+  return `${encodedHeader}.${encodedPayload}.${signature}`;
+}
+
+function verifySessionToken(token) {
+  const parts = normalizeString(token).split('.');
+  if (parts.length !== 3) {
+    return null;
+  }
+
+  const [encodedHeader, encodedPayload, encodedSignature] = parts;
+  const expectedSignature = createHmac('sha256', config.jwtSecret)
+    .update(`${encodedHeader}.${encodedPayload}`)
+    .digest('base64url');
+
+  if (!safeCompare(encodedSignature, expectedSignature)) {
+    return null;
+  }
+
+  try {
+    const header = JSON.parse(decodeBase64Url(encodedHeader));
+    const payload = JSON.parse(decodeBase64Url(encodedPayload));
+
+    if (header.alg !== 'HS256' || header.typ !== 'JWT') {
+      return null;
     }
-  });
+
+    const expiresAt = Number(payload.exp || 0);
+    if (!expiresAt || expiresAt * 1000 <= Date.now()) {
+      return null;
+    }
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function encodeBase64Url(value) {
+  return Buffer.from(value, 'utf8').toString('base64url');
+}
+
+function decodeBase64Url(value) {
+  return Buffer.from(value, 'base64url').toString('utf8');
+}
+
+function safeCompare(left, right) {
+  const leftBuffer = Buffer.from(String(left || ''), 'utf8');
+  const rightBuffer = Buffer.from(String(right || ''), 'utf8');
+
+  if (leftBuffer.length !== rightBuffer.length) {
+    return false;
+  }
+
+  return timingSafeEqual(leftBuffer, rightBuffer);
 }
 
 function hashPassword(password) {
@@ -1042,17 +1175,7 @@ function verifyPassword(password, storedHash) {
 }
 
 async function readJsonBody(request) {
-  const chunks = [];
-
-  for await (const chunk of request) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-
-  if (chunks.length === 0) {
-    return {};
-  }
-
-  const rawBody = Buffer.concat(chunks).toString('utf8').trim();
+  const rawBody = (await request.text()).trim();
   if (!rawBody) {
     return {};
   }
@@ -1105,29 +1228,77 @@ async function clearRange(sheets, range) {
   });
 }
 
-function setCorsHeaders(request, response) {
-  const requestOrigin = normalizeString(request.headers.origin);
+function getRequestHeader(request, name) {
+  if (request.headers?.get) {
+    return normalizeString(request.headers.get(name));
+  }
+
+  return normalizeString(request.headers?.[name]);
+}
+
+function buildCorsHeaders(request) {
+  const requestOrigin = getRequestHeader(request, 'origin');
+  const requestUrlOrigin = (() => {
+    try {
+      return new URL(request.url).origin;
+    } catch {
+      return '';
+    }
+  })();
+  const isSameOrigin = Boolean(requestOrigin) && requestOrigin === requestUrlOrigin;
   const allowAllOrigins = config.allowedOrigins.includes('*');
   const allowedOrigin =
-    allowAllOrigins || !requestOrigin || config.allowedOrigins.includes(requestOrigin)
+    allowAllOrigins || isSameOrigin || !requestOrigin || config.allowedOrigins.includes(requestOrigin)
       ? requestOrigin || '*'
       : config.allowedOrigins[0] || '*';
 
-  response.setHeader('Access-Control-Allow-Origin', allowedOrigin);
-  response.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  response.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  return {
+    'Access-Control-Allow-Origin': allowedOrigin,
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Expose-Headers': 'Content-Disposition',
+    Vary: 'Origin',
+  };
 }
 
-function sendJson(response, statusCode, payload) {
-  response.writeHead(statusCode, {
-    'Content-Type': 'application/json; charset=utf-8',
+function withCorsHeaders(request, response) {
+  const headers = new Headers(response.headers);
+  Object.entries(buildCorsHeaders(request)).forEach(([key, value]) => {
+    headers.set(key, value);
   });
-  response.end(JSON.stringify(payload));
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
-function handleServerError(response, error) {
+function sendJson(request, statusCode, payload) {
+  return withCorsHeaders(
+    request,
+    new Response(JSON.stringify(payload), {
+      status: statusCode,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+    }),
+  );
+}
+
+function sendBinary(request, statusCode, body, headers = {}) {
+  return withCorsHeaders(
+    request,
+    new Response(body, {
+      status: statusCode,
+      headers,
+    }),
+  );
+}
+
+function handleServerError(request, error) {
   if (error?.code === 'SETUP_REQUIRED') {
-    return sendJson(response, 503, {
+    return sendJson(request, 503, {
       ok: false,
       code: error.code,
       message: 'Falta configurar la conexion con Google Sheets.',
@@ -1137,11 +1308,11 @@ function handleServerError(response, error) {
 
   const googleAccessErrorPayload = getGoogleAccessErrorPayload(error);
   if (googleAccessErrorPayload) {
-    return sendJson(response, 503, googleAccessErrorPayload);
+    return sendJson(request, 503, googleAccessErrorPayload);
   }
 
   if (isGoogleQuotaError(error)) {
-    return sendJson(response, 429, {
+    return sendJson(request, 429, {
       ok: false,
       code: 'GOOGLE_SHEETS_QUOTA_EXCEEDED',
       message:
@@ -1150,7 +1321,7 @@ function handleServerError(response, error) {
   }
 
   if (error?.statusCode) {
-    return sendJson(response, error.statusCode, {
+    return sendJson(request, error.statusCode, {
       ok: false,
       message: error.message,
     });
@@ -1158,7 +1329,7 @@ function handleServerError(response, error) {
 
   console.error('[admin-server]', error);
 
-  return sendJson(response, 500, {
+  return sendJson(request, 500, {
     ok: false,
     message: 'Ocurrio un error inesperado en el panel admin.',
   });
@@ -1377,4 +1548,22 @@ function getConfiguredServiceAccountEmail() {
   } catch {
     return '';
   }
+}
+
+function getSessionSecret() {
+  const configuredSecret = normalizeString(process.env.ADMIN_JWT_SECRET);
+  if (configuredSecret) {
+    return configuredSecret;
+  }
+
+  if (isProductionRuntime()) {
+    return '';
+  }
+
+  return `local-admin-secret:${process.env.GOOGLE_SHEETS_SPREADSHEET_ID || DEFAULT_SPREADSHEET_ID}`;
+}
+
+function isProductionRuntime() {
+  return normalizeString(process.env.VERCEL) === '1' ||
+    normalizeString(process.env.NODE_ENV).toLowerCase() === 'production';
 }
