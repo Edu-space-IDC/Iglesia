@@ -57,8 +57,116 @@ const DEFAULT_ADMIN_ACCOUNT = {
 const SESSION_TTL_MS = 1000 * 60 * 60 * 12;
 const SESSION_TTL_SECONDS = SESSION_TTL_MS / 1000;
 const API_PREFIX = '/api/admin';
+const FORM_ADMIN_API_PREFIX = '/api/formulario-admin';
+const FORM_PUBLIC_API_PREFIX = '/api/formulario';
+const DYNAMIC_FORM_FIELDS_SHEET_NAME = 'Formulario Dinamico - Campos';
+const DYNAMIC_FORM_SETTINGS_SHEET_NAME = 'Formulario Dinamico - Ajustes';
+const DYNAMIC_FORM_RESPONSES_SHEET_NAME = 'Formulario Dinamico - Respuestas';
+const DYNAMIC_FORM_FIELD_HEADERS = [
+  'Key',
+  'Label',
+  'Type',
+  'Required',
+  'Placeholder',
+  'Helper Text',
+  'Auto Complete',
+  'Layout',
+  'Rows',
+  'Order',
+  'Active',
+];
+const DYNAMIC_FORM_SETTINGS_HEADERS = ['Key', 'Value'];
+const DYNAMIC_FORM_SETTINGS_KEYS = [
+  'eyebrow',
+  'title',
+  'description',
+  'submitButtonLabel',
+  'successMessage',
+  'privacyNote',
+];
+const DYNAMIC_FORM_RESPONSE_BASE_HEADERS = ['submittedAt'];
+const DEFAULT_DYNAMIC_FORM_SETTINGS = {
+  eyebrow: 'Formulario de bienvenida',
+  title: 'NOS ALEGRA TENERTE AQUI',
+  description:
+    'Queremos conocerte, darte la bienvenida a nuestra comunidad y orar contigo.',
+  submitButtonLabel: 'Enviar',
+  successMessage:
+    'Gracias por compartir tu informacion. Muy pronto estaremos en contacto contigo.',
+  privacyNote:
+    'Tus datos se usaran solo para darte seguimiento y poder orar por ti.',
+};
+const DEFAULT_DYNAMIC_FORM_FIELDS = [
+  {
+    key: 'firstName',
+    label: 'Nombre',
+    type: 'text',
+    required: true,
+    placeholder: 'Nombre',
+    helperText: '',
+    autoComplete: 'given-name',
+    layout: 'half',
+    rows: 0,
+    order: 0,
+    active: true,
+  },
+  {
+    key: 'lastName',
+    label: 'Apellidos',
+    type: 'text',
+    required: true,
+    placeholder: 'Apellidos',
+    helperText: '',
+    autoComplete: 'family-name',
+    layout: 'half',
+    rows: 0,
+    order: 1,
+    active: true,
+  },
+  {
+    key: 'phone',
+    label: 'Numero de contacto / Telefono',
+    type: 'tel',
+    required: true,
+    placeholder: '300 000 0000',
+    helperText: '',
+    autoComplete: 'tel',
+    layout: 'full',
+    rows: 0,
+    order: 2,
+    active: true,
+  },
+  {
+    key: 'email',
+    label: 'Correo electronico',
+    type: 'email',
+    required: false,
+    placeholder: 'nombre@correo.com',
+    helperText: '',
+    autoComplete: 'email',
+    layout: 'full',
+    rows: 0,
+    order: 3,
+    active: true,
+  },
+  {
+    key: 'prayerRequest',
+    label: 'Escribe aqui tu peticion de oracion',
+    type: 'textarea',
+    required: false,
+    placeholder: 'Queremos orar contigo. Cuentanos como podemos apoyarte.',
+    helperText: '',
+    autoComplete: '',
+    layout: 'full',
+    rows: 6,
+    order: 4,
+    active: true,
+  },
+];
 let runtimePromise = null;
 let spreadsheetSetupPromise = null;
+let dynamicFormSetupPromise = null;
+let dynamicFormSheetsPromise = null;
 
 loadEnvironmentFile('.env.admin');
 
@@ -83,6 +191,14 @@ export async function handleAdminRequest(request) {
 
   const url = new URL(request.url);
   const pathname = normalizePathname(url.pathname);
+
+  if (pathname.startsWith(FORM_ADMIN_API_PREFIX)) {
+    return handleDynamicFormAdminRequest(request, pathname);
+  }
+
+  if (pathname.startsWith(FORM_PUBLIC_API_PREFIX)) {
+    return handleDynamicFormPublicRequest(request, pathname);
+  }
 
   if (!pathname.startsWith(API_PREFIX)) {
     return sendJson(request, 404, {
@@ -186,7 +302,7 @@ export async function handleAdminRequest(request) {
     }
 
     if (pathname === `${API_PREFIX}/records` && request.method === 'GET') {
-      const data = await loadBootstrapData(runtime);
+      const data = await loadBootstrapData(runtime, session.username);
       return sendJson(request, 200, {
         ok: true,
         records: data.records,
@@ -242,6 +358,221 @@ export async function handleAdminRequest(request) {
     if (recordMatch && request.method === 'DELETE') {
       const sheetRow = Number.parseInt(recordMatch[1], 10);
       await deleteRecord(runtime, sheetRow);
+      return sendJson(request, 200, {
+        ok: true,
+      });
+    }
+
+    return sendJson(request, 404, {
+      ok: false,
+      message: 'Ruta no encontrada.',
+    });
+  } catch (error) {
+    return handleServerError(request, error);
+  }
+}
+
+async function handleDynamicFormPublicRequest(request, pathname) {
+  try {
+    if (pathname === `${FORM_PUBLIC_API_PREFIX}/config` && request.method === 'GET') {
+      const sheets = await getDynamicFormSheets();
+      const settings = await loadDynamicFormSettings(sheets);
+      const questions = await loadDynamicFormFields(sheets);
+      return sendJson(request, 200, {
+        ok: true,
+        ready: true,
+        settings,
+        questions,
+      });
+    }
+
+    if (pathname === `${FORM_PUBLIC_API_PREFIX}/submit` && request.method === 'POST') {
+      const sheets = await getDynamicFormSheets();
+      const body = await readJsonBody(request);
+      const questions = await loadDynamicFormFields(sheets);
+      const record = normalizeDynamicFormRecordInput(body, questions);
+      await appendDynamicFormRecord(sheets, questions, record);
+      return sendJson(request, 201, {
+        ok: true,
+      });
+    }
+
+    return sendJson(request, 404, {
+      ok: false,
+      message: 'Ruta no encontrada.',
+    });
+  } catch (error) {
+    return handleServerError(request, error);
+  }
+}
+
+async function handleDynamicFormAdminRequest(request, pathname) {
+  try {
+    if (pathname === `${FORM_ADMIN_API_PREFIX}/public-config` && request.method === 'GET') {
+      const readiness = await getSetupReadiness();
+      return sendJson(request, 200, {
+        ok: true,
+        ready: readiness.ready,
+        missing: readiness.missing,
+        spreadsheetId: config.spreadsheetId,
+        responsesSheetName: DYNAMIC_FORM_RESPONSES_SHEET_NAME,
+        serviceAccountFile: config.googleServiceAccountFile,
+        defaultCredentials: {
+          username: DEFAULT_ADMIN_ACCOUNT.username,
+          alias: DEFAULT_ADMIN_ACCOUNT.aliases[0],
+          password: DEFAULT_ADMIN_ACCOUNT.password,
+        },
+      });
+    }
+
+    if (pathname === `${FORM_ADMIN_API_PREFIX}/login` && request.method === 'POST') {
+      const runtime = await getRuntime();
+      await ensureDynamicFormRuntime(runtime.sheets);
+      const body = await readJsonBody(request);
+      const username = normalizeString(body.username).toLowerCase();
+      const password = normalizeString(body.password);
+
+      if (!username || !password) {
+        return sendJson(request, 400, {
+          ok: false,
+          message: 'Ingresa tu usuario y contrasena.',
+        });
+      }
+
+      const account = await readAdminAccount(runtime, username, { throwIfMissing: false });
+      const passwordCheck = account
+        ? verifyStoredPassword(password, account.passwordHash)
+        : { valid: false, shouldUpgrade: false };
+
+      if (!account || !passwordCheck.valid) {
+        return sendJson(request, 401, {
+          ok: false,
+          message: 'Usuario o contrasena incorrectos.',
+        });
+      }
+
+      if (passwordCheck.shouldUpgrade) {
+        account.passwordHash = hashPassword(password);
+        account.updatedAt = formatBogotaDate();
+        await saveAdminAccountRow(runtime.sheets, account);
+      }
+
+      const token = createSessionToken(account);
+      return sendJson(request, 200, {
+        ok: true,
+        token,
+        profile: toProfile(account),
+      });
+    }
+
+    if (pathname === `${FORM_ADMIN_API_PREFIX}/logout` && request.method === 'POST') {
+      return sendJson(request, 200, {
+        ok: true,
+      });
+    }
+
+    const session = requireSession(request);
+
+    if (pathname === `${FORM_ADMIN_API_PREFIX}/records/export` && request.method === 'GET') {
+      const sheets = await getDynamicFormSheets();
+      const exportResult = await buildDynamicFormWorkbookFromSheets(sheets);
+      return sendBinary(request, 200, exportResult.buffer, {
+        'Content-Type':
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'Content-Disposition': `attachment; filename="${exportResult.filename}"`,
+        'Cache-Control': 'no-store',
+      });
+    }
+
+    const runtime = await getRuntime();
+    await ensureDynamicFormRuntime(runtime.sheets);
+
+    if (pathname === `${FORM_ADMIN_API_PREFIX}/session` && request.method === 'GET') {
+      const account = await readAdminAccount(runtime, session.username);
+      return sendJson(request, 200, {
+        ok: true,
+        profile: toProfile(account),
+      });
+    }
+
+    if (pathname === `${FORM_ADMIN_API_PREFIX}/bootstrap` && request.method === 'GET') {
+      const data = await loadDynamicFormBootstrapData(runtime, session.username);
+      return sendJson(request, 200, {
+        ok: true,
+        ...data,
+      });
+    }
+
+    if (pathname === `${FORM_ADMIN_API_PREFIX}/records` && request.method === 'GET') {
+      const data = await loadDynamicFormBootstrapData(runtime, session.username);
+      return sendJson(request, 200, {
+        ok: true,
+        records: data.records,
+        questions: data.questions,
+        settings: data.settings,
+      });
+    }
+
+    if (pathname === `${FORM_ADMIN_API_PREFIX}/records` && request.method === 'POST') {
+      const body = await readJsonBody(request);
+      const questions = await loadDynamicFormFields(runtime.sheets);
+      const record = normalizeDynamicFormRecordInput(body, questions);
+      const createdRecord = await createDynamicFormRecord(runtime.sheets, questions, record);
+      return sendJson(request, 201, {
+        ok: true,
+        record: createdRecord,
+      });
+    }
+
+    if (pathname === `${FORM_ADMIN_API_PREFIX}/records` && request.method === 'DELETE') {
+      const questions = await loadDynamicFormFields(runtime.sheets);
+      await clearDynamicFormRecords(runtime.sheets, questions);
+      return sendJson(request, 200, {
+        ok: true,
+      });
+    }
+
+    if (pathname === `${FORM_ADMIN_API_PREFIX}/form-config` && request.method === 'PUT') {
+      const body = await readJsonBody(request);
+      const settings = await saveDynamicFormSettings(runtime.sheets, body.settings || {});
+      const questions = await saveDynamicFormFields(runtime.sheets, body.questions || []);
+      return sendJson(request, 200, {
+        ok: true,
+        settings,
+        questions,
+      });
+    }
+
+    if (pathname === `${FORM_ADMIN_API_PREFIX}/account` && request.method === 'PUT') {
+      const body = await readJsonBody(request);
+      const updatedAccount = await updateAdminAccount(runtime, session.username, body);
+      return sendJson(request, 200, {
+        ok: true,
+        profile: toProfile(updatedAccount),
+      });
+    }
+
+    const recordMatch = pathname.match(/^\/api\/formulario-admin\/records\/(\d+)$/u);
+    if (recordMatch && request.method === 'PUT') {
+      const body = await readJsonBody(request);
+      const sheetRow = Number.parseInt(recordMatch[1], 10);
+      const questions = await loadDynamicFormFields(runtime.sheets);
+      const record = normalizeDynamicFormRecordInput(body, questions);
+      const updatedRecord = await updateDynamicFormRecord(
+        runtime.sheets,
+        questions,
+        sheetRow,
+        record,
+      );
+      return sendJson(request, 200, {
+        ok: true,
+        record: updatedRecord,
+      });
+    }
+
+    if (recordMatch && request.method === 'DELETE') {
+      const sheetRow = Number.parseInt(recordMatch[1], 10);
+      await deleteDynamicFormRecord(runtime.sheets, sheetRow);
       return sendJson(request, 200, {
         ok: true,
       });
@@ -592,6 +923,508 @@ async function ensureDefaultStatuses(sheets) {
       status.active ? 'TRUE' : 'FALSE',
     ]),
   );
+}
+
+async function getDynamicFormSheets() {
+  if (!dynamicFormSheetsPromise) {
+    dynamicFormSheetsPromise = createSheetsClient().catch((error) => {
+      dynamicFormSheetsPromise = null;
+      throw error;
+    });
+  }
+
+  const sheets = await dynamicFormSheetsPromise;
+  await ensureDynamicFormRuntime(sheets);
+  return sheets;
+}
+
+async function ensureDynamicFormRuntime(sheets) {
+  if (!dynamicFormSetupPromise) {
+    dynamicFormSetupPromise = ensureDynamicFormStructure(sheets).catch((error) => {
+      dynamicFormSetupPromise = null;
+      throw error;
+    });
+  }
+
+  await dynamicFormSetupPromise;
+}
+
+async function ensureDynamicFormStructure(sheets) {
+  const metadata = await getSpreadsheetMetadata(sheets);
+
+  await ensureSheetWithHeaders(
+    sheets,
+    metadata,
+    DYNAMIC_FORM_SETTINGS_SHEET_NAME,
+    DYNAMIC_FORM_SETTINGS_HEADERS,
+  );
+  await ensureSheetWithHeaders(
+    sheets,
+    metadata,
+    DYNAMIC_FORM_FIELDS_SHEET_NAME,
+    DYNAMIC_FORM_FIELD_HEADERS,
+  );
+  await ensureSheetWithHeaders(
+    sheets,
+    metadata,
+    DYNAMIC_FORM_RESPONSES_SHEET_NAME,
+    DYNAMIC_FORM_RESPONSE_BASE_HEADERS,
+  );
+
+  await ensureDefaultDynamicFormSettings(sheets);
+  await ensureDefaultDynamicFormFields(sheets);
+  const questions = await loadDynamicFormFields(sheets);
+  await ensureDynamicFormResponseHeaders(sheets, questions);
+}
+
+async function ensureDefaultDynamicFormSettings(sheets) {
+  const rows = await getRangeValues(
+    sheets,
+    `${escapeSheetTitle(DYNAMIC_FORM_SETTINGS_SHEET_NAME)}!A2:B`,
+  );
+
+  if (rows.some((row) => rowHasContent(row))) {
+    return;
+  }
+
+  await updateRangeValues(
+    sheets,
+    `${escapeSheetTitle(DYNAMIC_FORM_SETTINGS_SHEET_NAME)}!A2`,
+    DYNAMIC_FORM_SETTINGS_KEYS.map((key) => [key, DEFAULT_DYNAMIC_FORM_SETTINGS[key]]),
+  );
+}
+
+async function ensureDefaultDynamicFormFields(sheets) {
+  const rows = await getRangeValues(
+    sheets,
+    `${escapeSheetTitle(DYNAMIC_FORM_FIELDS_SHEET_NAME)}!A2:K`,
+  );
+
+  if (rows.some((row) => rowHasContent(row))) {
+    return;
+  }
+
+  await updateRangeValues(
+    sheets,
+    `${escapeSheetTitle(DYNAMIC_FORM_FIELDS_SHEET_NAME)}!A2`,
+    DEFAULT_DYNAMIC_FORM_FIELDS.map(dynamicFormFieldToRow),
+  );
+}
+
+async function ensureDynamicFormResponseHeaders(sheets, questions) {
+  const headerRow = await getRangeValues(
+    sheets,
+    `${escapeSheetTitle(DYNAMIC_FORM_RESPONSES_SHEET_NAME)}!A1:${toSheetColumnName(
+      Math.max(1, questions.length + 1),
+    )}1`,
+  );
+  const currentHeaders = (headerRow[0] || []).map((value) => normalizeString(value));
+  const nextHeaders = buildDynamicFormResponseHeaders(questions);
+  const hasDifferences = nextHeaders.some(
+    (header, index) => normalizeString(currentHeaders[index]) !== header,
+  );
+
+  if (headerRow.length === 0 || hasDifferences) {
+    await updateRangeValues(
+      sheets,
+      `${escapeSheetTitle(DYNAMIC_FORM_RESPONSES_SHEET_NAME)}!A1`,
+      [mergeDynamicFormHeaders(currentHeaders, nextHeaders)],
+    );
+  }
+}
+
+function buildDynamicFormResponseHeaders(questions) {
+  return [
+    ...DYNAMIC_FORM_RESPONSE_BASE_HEADERS,
+    ...questions.map((question) => question.key),
+  ];
+}
+
+function mergeDynamicFormHeaders(currentHeaders, nextHeaders) {
+  const mergedHeaders = [...nextHeaders];
+  currentHeaders.forEach((header) => {
+    if (header && !mergedHeaders.includes(header)) {
+      mergedHeaders.push(header);
+    }
+  });
+  return mergedHeaders;
+}
+
+async function loadDynamicFormSettings(sheets) {
+  const rows = await getRangeValues(
+    sheets,
+    `${escapeSheetTitle(DYNAMIC_FORM_SETTINGS_SHEET_NAME)}!A2:B`,
+  );
+
+  const settings = { ...DEFAULT_DYNAMIC_FORM_SETTINGS };
+  rows.forEach((row) => {
+    const key = normalizeString(row[0]);
+    if (key && Object.hasOwn(DEFAULT_DYNAMIC_FORM_SETTINGS, key)) {
+      settings[key] = normalizeString(row[1]) || DEFAULT_DYNAMIC_FORM_SETTINGS[key];
+    }
+  });
+
+  return settings;
+}
+
+async function saveDynamicFormSettings(sheets, incomingSettings) {
+  const nextSettings = { ...DEFAULT_DYNAMIC_FORM_SETTINGS };
+  DYNAMIC_FORM_SETTINGS_KEYS.forEach((key) => {
+    nextSettings[key] =
+      normalizeString(incomingSettings?.[key]) || DEFAULT_DYNAMIC_FORM_SETTINGS[key];
+  });
+
+  await clearRange(sheets, `${escapeSheetTitle(DYNAMIC_FORM_SETTINGS_SHEET_NAME)}!A2:B`);
+  await updateRangeValues(
+    sheets,
+    `${escapeSheetTitle(DYNAMIC_FORM_SETTINGS_SHEET_NAME)}!A2`,
+    DYNAMIC_FORM_SETTINGS_KEYS.map((key) => [key, nextSettings[key]]),
+  );
+
+  return nextSettings;
+}
+
+async function loadDynamicFormFields(sheets) {
+  const rows = await getRangeValues(
+    sheets,
+    `${escapeSheetTitle(DYNAMIC_FORM_FIELDS_SHEET_NAME)}!A2:K`,
+  );
+
+  const questions = rows
+    .map((row, index) => parseDynamicFormFieldRow(row, index))
+    .filter(Boolean)
+    .filter((question) => question.active !== false)
+    .sort((left, right) => left.order - right.order);
+
+  if (questions.length > 0) {
+    return questions;
+  }
+
+  await ensureDefaultDynamicFormFields(sheets);
+  return loadDynamicFormFields(sheets);
+}
+
+async function saveDynamicFormFields(sheets, incomingQuestions) {
+  const questions = normalizeDynamicFormFieldsInput(incomingQuestions);
+
+  await clearRange(sheets, `${escapeSheetTitle(DYNAMIC_FORM_FIELDS_SHEET_NAME)}!A2:K`);
+  await updateRangeValues(
+    sheets,
+    `${escapeSheetTitle(DYNAMIC_FORM_FIELDS_SHEET_NAME)}!A2`,
+    questions.map(dynamicFormFieldToRow),
+  );
+  await ensureDynamicFormResponseHeaders(sheets, questions);
+
+  return questions;
+}
+
+function parseDynamicFormFieldRow(row, index) {
+  if (!rowHasContent(row)) {
+    return null;
+  }
+
+  const key = normalizeDynamicFormFieldKey(row[0]);
+  const label = normalizeString(row[1]);
+  const type = normalizeDynamicFormQuestionType(row[2]);
+
+  if (!key || !label || !type) {
+    return null;
+  }
+
+  return {
+    key,
+    label,
+    type,
+    required: normalizeDynamicFormRequired(row[3]),
+    placeholder: normalizeString(row[4]),
+    helperText: normalizeString(row[5]),
+    autoComplete: normalizeString(row[6]),
+    layout: normalizeDynamicFormLayout(row[7]),
+    rows: normalizeDynamicFormRows(row[8], type),
+    order: Number.parseInt(normalizeString(row[9]) || String(index), 10),
+    active: normalizeBoolean(row[10]),
+  };
+}
+
+function normalizeDynamicFormFieldsInput(incomingQuestions) {
+  if (!Array.isArray(incomingQuestions) || incomingQuestions.length === 0) {
+    throw createHttpError(400, 'Debes dejar al menos una pregunta en el formulario.');
+  }
+
+  const seenKeys = new Set();
+
+  return incomingQuestions.map((question, index) => {
+    const key = normalizeDynamicFormFieldKey(
+      question.key || question.name || question.id || question.label,
+    );
+    const label = normalizeString(question.label);
+    const type = normalizeDynamicFormQuestionType(question.type);
+
+    if (!key) {
+      throw createHttpError(400, 'Cada pregunta debe tener una llave valida.');
+    }
+
+    if (!label) {
+      throw createHttpError(400, 'Cada pregunta debe tener un titulo visible.');
+    }
+
+    if (!type) {
+      throw createHttpError(400, 'Cada pregunta debe tener un tipo valido.');
+    }
+
+    if (seenKeys.has(key.toLowerCase())) {
+      throw createHttpError(400, 'No repitas llaves internas en las preguntas.');
+    }
+
+    seenKeys.add(key.toLowerCase());
+
+    return {
+      key,
+      label,
+      type,
+      required: Boolean(question.required),
+      placeholder: normalizeString(question.placeholder),
+      helperText: normalizeString(question.helperText),
+      autoComplete: normalizeString(question.autoComplete),
+      layout: normalizeDynamicFormLayout(question.layout),
+      rows: normalizeDynamicFormRows(question.rows, type),
+      order: index,
+      active: true,
+    };
+  });
+}
+
+function dynamicFormFieldToRow(question) {
+  return [
+    question.key,
+    question.label,
+    question.type,
+    question.required ? 'TRUE' : 'FALSE',
+    question.placeholder,
+    question.helperText,
+    question.autoComplete,
+    question.layout,
+    question.rows ? String(question.rows) : '',
+    String(question.order),
+    question.active === false ? 'FALSE' : 'TRUE',
+  ];
+}
+
+function normalizeDynamicFormFieldKey(value) {
+  return normalizeString(value)
+    .replace(/[^a-zA-Z0-9_-]+/gu, '-')
+    .replace(/^-+|-+$/gu, '')
+    .slice(0, 80);
+}
+
+function normalizeDynamicFormQuestionType(value) {
+  const normalized = normalizeString(value).toLowerCase();
+  if (['text', 'tel', 'email', 'textarea'].includes(normalized)) {
+    return normalized;
+  }
+  return '';
+}
+
+function normalizeDynamicFormLayout(value) {
+  return normalizeString(value).toLowerCase() === 'half' ? 'half' : 'full';
+}
+
+function normalizeDynamicFormRequired(value) {
+  const normalized = normalizeString(value).toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return normalized === 'true' || normalized === '1' || normalized === 'si' || normalized === 'yes';
+}
+
+function normalizeDynamicFormRows(value, type) {
+  if (type !== 'textarea') {
+    return 0;
+  }
+
+  const parsed = Number.parseInt(normalizeString(value) || '6', 10);
+  if (!Number.isFinite(parsed) || parsed < 2) {
+    return 6;
+  }
+  return parsed;
+}
+
+function normalizeDynamicFormRecordInput(input, questions) {
+  const rawValues = input && typeof input.values === 'object' && input.values !== null
+    ? input.values
+    : input;
+
+  const values = {};
+  questions.forEach((question) => {
+    const value = normalizeString(rawValues?.[question.key]);
+    if (question.required && !value) {
+      throw createHttpError(400, `La pregunta "${question.label}" es obligatoria.`);
+    }
+    values[question.key] = value;
+  });
+
+  return {
+    submittedAt: normalizeString(input?.submittedAt) || formatBogotaDate(),
+    values,
+  };
+}
+
+async function loadDynamicFormBootstrapData(runtime, identity) {
+  const profile = toProfile(await readAdminAccount(runtime, identity));
+  const settings = await loadDynamicFormSettings(runtime.sheets);
+  const questions = await loadDynamicFormFields(runtime.sheets);
+  const records = await loadDynamicFormRecords(runtime.sheets, questions);
+
+  return {
+    profile,
+    settings,
+    questions,
+    records,
+  };
+}
+
+async function loadDynamicFormRecords(sheets, questions) {
+  const headers = buildDynamicFormResponseHeaders(questions);
+  const endColumn = toSheetColumnName(headers.length);
+  const rows = await getRangeValues(
+    sheets,
+    `${escapeSheetTitle(DYNAMIC_FORM_RESPONSES_SHEET_NAME)}!A2:${endColumn}`,
+  );
+
+  return rows
+    .map((row, index) => {
+      const values = {};
+      questions.forEach((question, questionIndex) => {
+        values[question.key] = normalizeString(row[questionIndex + 1]);
+      });
+
+      const submittedAt = normalizeString(row[0]);
+      const hasContent = submittedAt || Object.values(values).some(Boolean);
+      if (!hasContent) {
+        return null;
+      }
+
+      return {
+        sheetRow: index + 2,
+        submittedAt: submittedAt || formatBogotaDate(),
+        values,
+      };
+    })
+    .filter(Boolean);
+}
+
+async function appendDynamicFormRecord(sheets, questions, record) {
+  await ensureDynamicFormResponseHeaders(sheets, questions);
+  const appendResult = await appendRangeValues(
+    sheets,
+    `${escapeSheetTitle(DYNAMIC_FORM_RESPONSES_SHEET_NAME)}!A2`,
+    dynamicFormRecordToRow(record, questions),
+  );
+  return extractSheetRowFromAppendResult(appendResult);
+}
+
+async function createDynamicFormRecord(sheets, questions, record) {
+  const sheetRow = await appendDynamicFormRecord(sheets, questions, record);
+  return {
+    sheetRow,
+    ...record,
+  };
+}
+
+async function updateDynamicFormRecord(sheets, questions, sheetRow, record) {
+  assertValidSheetRow(sheetRow);
+  const endColumn = toSheetColumnName(questions.length + 1);
+  await updateRangeValues(
+    sheets,
+    `${escapeSheetTitle(DYNAMIC_FORM_RESPONSES_SHEET_NAME)}!A${sheetRow}:${endColumn}${sheetRow}`,
+    [dynamicFormRecordToRow(record, questions)],
+  );
+
+  return {
+    sheetRow,
+    ...record,
+  };
+}
+
+async function deleteDynamicFormRecord(sheets, sheetRow) {
+  assertValidSheetRow(sheetRow);
+  const metadata = await getSpreadsheetMetadata(sheets);
+  const sheet = findSheetByTitle(metadata, DYNAMIC_FORM_RESPONSES_SHEET_NAME);
+  const sheetId = sheet?.properties?.sheetId;
+
+  if (typeof sheetId !== 'number') {
+    throw new Error('No encontramos la hoja de respuestas del formulario dinamico.');
+  }
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: config.spreadsheetId,
+    requestBody: {
+      requests: [
+        {
+          deleteDimension: {
+            range: {
+              sheetId,
+              dimension: 'ROWS',
+              startIndex: sheetRow - 1,
+              endIndex: sheetRow,
+            },
+          },
+        },
+      ],
+    },
+  });
+}
+
+async function clearDynamicFormRecords(sheets, questions) {
+  const endColumn = toSheetColumnName(questions.length + 1);
+  await clearRange(
+    sheets,
+    `${escapeSheetTitle(DYNAMIC_FORM_RESPONSES_SHEET_NAME)}!A2:${endColumn}`,
+  );
+}
+
+function dynamicFormRecordToRow(record, questions) {
+  return [
+    sanitizeCellValue(record.submittedAt),
+    ...questions.map((question) => sanitizeCellValue(record.values?.[question.key] || '')),
+  ];
+}
+
+async function buildDynamicFormWorkbookFromSheets(sheets) {
+  const questions = await loadDynamicFormFields(sheets);
+  const records = await loadDynamicFormRecords(sheets, questions);
+  const worksheetRows = [
+    ['Fecha y hora', ...questions.map((question) => question.label)],
+    ...records.map((record) => [
+      record.submittedAt,
+      ...questions.map((question) => record.values?.[question.key] || ''),
+    ]),
+  ];
+
+  const worksheet = XLSX.utils.aoa_to_sheet(worksheetRows);
+  worksheet['!cols'] = [
+    { wch: 22 },
+    ...questions.map((question) => ({
+      wch: Math.min(Math.max(question.label.length + 6, 18), 38),
+    })),
+  ];
+
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, 'Encuestados');
+
+  return {
+    filename: buildDynamicFormExportFilename(),
+    buffer: XLSX.write(workbook, {
+      bookType: 'xlsx',
+      type: 'buffer',
+    }),
+  };
+}
+
+function buildDynamicFormExportFilename() {
+  const timestamp = formatBogotaDate().replace(/[:\s]/gu, '-');
+  return `formulario-dinamico-${timestamp}.xlsx`;
 }
 
 async function readAdminAccounts(runtime) {
@@ -1722,6 +2555,22 @@ function extractSheetRowFromAppendResult(result) {
   }
 
   return Number.parseInt(match[1], 10);
+}
+
+function toSheetColumnName(columnNumber) {
+  let value = Number.parseInt(String(columnNumber || 0), 10);
+  if (!Number.isFinite(value) || value < 1) {
+    return 'A';
+  }
+
+  let columnName = '';
+  while (value > 0) {
+    const remainder = (value - 1) % 26;
+    columnName = String.fromCharCode(65 + remainder) + columnName;
+    value = Math.floor((value - 1) / 26);
+  }
+
+  return columnName;
 }
 
 function buildRecordsExportFilename() {

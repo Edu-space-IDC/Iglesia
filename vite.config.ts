@@ -63,12 +63,22 @@ export default defineConfig({
       input: {
         main: path.resolve(__dirname, 'index.html'),
         admin: path.resolve(__dirname, 'admin.html'),
+        formulario: path.resolve(__dirname, 'formulario.html'),
+        formularioAdmin: path.resolve(__dirname, 'formulario-admin.html'),
       },
     },
   },
   server: {
     proxy: {
       '/api/admin': {
+        target: `http://${adminServerHost}:${adminServerPort}`,
+        changeOrigin: true,
+      },
+      '/api/formulario-admin': {
+        target: `http://${adminServerHost}:${adminServerPort}`,
+        changeOrigin: true,
+      },
+      '/api/formulario': {
         target: `http://${adminServerHost}:${adminServerPort}`,
         changeOrigin: true,
       },
