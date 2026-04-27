@@ -149,6 +149,22 @@ Admin Usuarios
 
 La contrasena no se guarda en texto plano. Se guarda con hash.
 
+Ahora tambien puedes tener varios administradores en esa misma pestana.
+
+Cada fila desde `A2` en adelante se interpreta como un usuario distinto con este orden:
+
+```text
+Username | Display Name | Email | Password Hash | Aliases | Updated At
+```
+
+Notas utiles:
+
+- si creas un usuario manualmente desde Excel, puedes escribir la contrasena en texto normal en `Password Hash`
+- en el primer login exitoso, el sistema la convierte automaticamente a hash
+- `Aliases` acepta varios valores separados por comas
+- cualquier fila vacia se ignora
+- el login reconoce tanto `Username` como cualquiera de los `Aliases`
+
 ## 10. Apps Script publico
 
 La web publica puede seguir enviando respuestas por Apps Script como hasta ahora.
