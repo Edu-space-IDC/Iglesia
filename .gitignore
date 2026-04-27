@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.env.admin
+server/credentials/google-service-account.json
+server/*.log
+*.local
