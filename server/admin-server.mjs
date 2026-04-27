@@ -153,6 +153,18 @@ export async function handleAdminRequest(request) {
     }
 
     requireSession(request);
+
+    if (pathname === `${API_PREFIX}/records/export` && request.method === 'GET') {
+      const sheets = await createSheetsClient();
+      const exportResult = await buildRecordsWorkbookFromSheets(sheets);
+      return sendBinary(request, 200, exportResult.buffer, {
+        'Content-Type':
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'Content-Disposition': `attachment; filename="${exportResult.filename}"`,
+        'Cache-Control': 'no-store',
+      });
+    }
+
     const runtime = await getRuntime();
 
     if (pathname === `${API_PREFIX}/session` && request.method === 'GET') {
@@ -177,16 +189,6 @@ export async function handleAdminRequest(request) {
         ok: true,
         records: data.records,
         statuses: data.statuses,
-      });
-    }
-
-    if (pathname === `${API_PREFIX}/records/export` && request.method === 'GET') {
-      const exportResult = await buildRecordsWorkbook(runtime);
-      return sendBinary(request, 200, exportResult.buffer, {
-        'Content-Type':
-          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'Content-Disposition': `attachment; filename="${exportResult.filename}"`,
-        'Cache-Control': 'no-store',
       });
     }
 
@@ -659,6 +661,43 @@ async function buildRecordsWorkbook(runtime) {
       record.submittedAt,
       record.status,
     ]),
+  ];
+
+  const worksheet = XLSX.utils.aoa_to_sheet(worksheetRows);
+  worksheet['!cols'] = [
+    { wch: 20 },
+    { wch: 24 },
+    { wch: 18 },
+    { wch: 30 },
+    { wch: 40 },
+    { wch: 18 },
+    { wch: 22 },
+    { wch: 18 },
+  ];
+
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, 'Encuestas');
+
+  return {
+    filename: buildRecordsExportFilename(),
+    buffer: XLSX.write(workbook, {
+      bookType: 'xlsx',
+      type: 'buffer',
+    }),
+  };
+}
+
+async function buildRecordsWorkbookFromSheets(sheets) {
+  const rows = await getRangeValues(
+    sheets,
+    `${escapeSheetTitle(config.responsesSheetName)}!A1:H`,
+  );
+  const dataRows = rows.length > 0 ? rows.slice(1) : [];
+  const worksheetRows = [
+    EXPORT_HEADERS,
+    ...dataRows.map((row) =>
+      EXPORT_HEADERS.map((_, index) => normalizeString(row[index])),
+    ),
   ];
 
   const worksheet = XLSX.utils.aoa_to_sheet(worksheetRows);
