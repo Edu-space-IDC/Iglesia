@@ -29,6 +29,7 @@ import {
 import {
   AdminApiError,
   createRecord,
+  deleteAllRecords,
   deleteRecord,
   downloadRecordsExcel,
   getBootstrap,
@@ -98,6 +99,7 @@ export default function AdminApp() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isSavingRecord, setIsSavingRecord] = useState(false);
   const [isDeletingRecord, setIsDeletingRecord] = useState(false);
+  const [isClearingAllRecords, setIsClearingAllRecords] = useState(false);
   const [isSavingStatuses, setIsSavingStatuses] = useState(false);
   const [isSavingAccount, setIsSavingAccount] = useState(false);
   const [isDownloadingExport, setIsDownloadingExport] = useState(false);
@@ -209,6 +211,7 @@ export default function AdminApp() {
     isLoggingIn,
     isSavingRecord,
     isDeletingRecord,
+    isClearingAllRecords,
     isSavingStatuses,
     isSavingAccount,
     isRecordDirty,
@@ -264,6 +267,7 @@ export default function AdminApp() {
         isLoggingIn ||
         isSavingRecord ||
         isDeletingRecord ||
+        isClearingAllRecords ||
         isSavingStatuses ||
         isSavingAccount)
     ) {
@@ -541,6 +545,44 @@ export default function AdminApp() {
       });
     } finally {
       setIsDeletingRecord(false);
+    }
+  }
+
+  async function handleClearAllRecords() {
+    if (!token || records.length === 0) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Vas a borrar ${records.length} encuesta${records.length === 1 ? '' : 's'} de la hoja principal. Esta accion no se puede deshacer.`,
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setIsClearingAllRecords(true);
+    setNotice(null);
+
+    try {
+      await deleteAllRecords(token);
+      setIsRecordDirty(false);
+      setSelectedRecord(null);
+      setRecordDraft(null);
+      await refreshDashboard(token, null);
+      setNotice({
+        type: 'success',
+        message: 'Todos los datos de encuestas fueron eliminados de la hoja principal.',
+      });
+    } catch (error) {
+      const parsedError = parseAdminError(error);
+      setNotice({
+        type: 'error',
+        message: parsedError.message,
+        details: parsedError.details,
+      });
+    } finally {
+      setIsClearingAllRecords(false);
     }
   }
 
@@ -869,6 +911,20 @@ export default function AdminApp() {
               <span>{isDownloadingExport ? 'Descargando...' : 'Descargar Excel'}</span>
             </button>
 
+            <button
+              type="button"
+              onClick={() => void handleClearAllRecords()}
+              disabled={isClearingAllRecords || records.length === 0}
+              className={dangerButtonClassName}
+            >
+              {isClearingAllRecords ? (
+                <LoaderCircle className="h-4 w-4 animate-spin" />
+              ) : (
+                <Trash2 className="h-4 w-4" />
+              )}
+              <span>{isClearingAllRecords ? 'Vaciando...' : 'Vaciar datos'}</span>
+            </button>
+
             <button type="button" onClick={() => void handleLogout()} className={secondaryButtonClassName}>
               <LogOut className="h-4 w-4" />
               <span>Salir</span>
@@ -1102,7 +1158,7 @@ export default function AdminApp() {
                       type="button"
                       onClick={() => void handleDeleteRecord()}
                       disabled={isDeletingRecord}
-                      className="inline-flex items-center gap-2 rounded-2xl border border-rose-400/25 bg-rose-500/12 px-4 py-3 text-sm font-semibold text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-70"
+                      className={dangerButtonClassName}
                     >
                       {isDeletingRecord ? (
                         <LoaderCircle className="h-4 w-4 animate-spin" />
@@ -1717,3 +1773,6 @@ const primaryButtonClassName =
 
 const secondaryButtonClassName =
   'inline-flex items-center gap-2 rounded-2xl border border-white/10 bg-slate-900/20 px-4 py-3 text-sm font-semibold text-gray-100 shadow-sm transition hover:bg-slate-900/35 disabled:cursor-not-allowed disabled:opacity-70';
+
+const dangerButtonClassName =
+  'inline-flex items-center gap-2 rounded-2xl border border-rose-400/25 bg-rose-500/12 px-4 py-3 text-sm font-semibold text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-70';

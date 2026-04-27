@@ -112,7 +112,6 @@ export async function handleAdminRequest(request) {
     if (pathname === `${API_PREFIX}/login` && request.method === 'POST') {
       const runtime = await getRuntime();
       const body = await readJsonBody(request);
-      const account = await readAdminAccount(runtime);
       const username = normalizeString(body.username).toLowerCase();
       const password = normalizeString(body.password);
 
@@ -123,19 +122,22 @@ export async function handleAdminRequest(request) {
         });
       }
 
-      const validNames = new Set(
-        [account.username, ...(account.aliases || [])]
-          .map((value) => normalizeString(value).toLowerCase())
-          .filter(Boolean),
-      );
-      const isUsernameValid = validNames.has(username);
-      const isPasswordValid = verifyPassword(password, account.passwordHash);
+      const account = await readAdminAccount(runtime, username, { throwIfMissing: false });
+      const passwordCheck = account
+        ? verifyStoredPassword(password, account.passwordHash)
+        : { valid: false, shouldUpgrade: false };
 
-      if (!isUsernameValid || !isPasswordValid) {
+      if (!account || !passwordCheck.valid) {
         return sendJson(request, 401, {
           ok: false,
           message: 'Usuario o contrasena incorrectos.',
         });
+      }
+
+      if (passwordCheck.shouldUpgrade) {
+        account.passwordHash = hashPassword(password);
+        account.updatedAt = formatBogotaDate();
+        await saveAdminAccountRow(runtime.sheets, account);
       }
 
       const token = createSessionToken(account);
@@ -152,7 +154,7 @@ export async function handleAdminRequest(request) {
       });
     }
 
-    requireSession(request);
+    const session = requireSession(request);
 
     if (pathname === `${API_PREFIX}/records/export` && request.method === 'GET') {
       const sheets = await createSheetsClient();
@@ -168,7 +170,7 @@ export async function handleAdminRequest(request) {
     const runtime = await getRuntime();
 
     if (pathname === `${API_PREFIX}/session` && request.method === 'GET') {
-      const account = await readAdminAccount(runtime);
+      const account = await readAdminAccount(runtime, session.username);
       return sendJson(request, 200, {
         ok: true,
         profile: toProfile(account),
@@ -176,7 +178,7 @@ export async function handleAdminRequest(request) {
     }
 
     if (pathname === `${API_PREFIX}/bootstrap` && request.method === 'GET') {
-      const data = await loadBootstrapData(runtime);
+      const data = await loadBootstrapData(runtime, session.username);
       return sendJson(request, 200, {
         ok: true,
         ...data,
@@ -201,6 +203,13 @@ export async function handleAdminRequest(request) {
       });
     }
 
+    if (pathname === `${API_PREFIX}/records` && request.method === 'DELETE') {
+      await deleteAllRecords(runtime);
+      return sendJson(request, 200, {
+        ok: true,
+      });
+    }
+
     if (pathname === `${API_PREFIX}/statuses` && request.method === 'PUT') {
       const body = await readJsonBody(request);
       const statuses = await saveStatuses(runtime, body.statuses || []);
@@ -212,7 +221,7 @@ export async function handleAdminRequest(request) {
 
     if (pathname === `${API_PREFIX}/account` && request.method === 'PUT') {
       const body = await readJsonBody(request);
-      const updatedAccount = await updateAdminAccount(runtime, body);
+      const updatedAccount = await updateAdminAccount(runtime, session.username, body);
       return sendJson(request, 200, {
         ok: true,
         profile: toProfile(updatedAccount),
@@ -547,23 +556,23 @@ function findSheetByTitle(metadata, title) {
 
 async function ensureDefaultAdminAccount(sheets) {
   const rows = await getRangeValues(sheets, `${escapeSheetTitle(ADMIN_USERS_SHEET_NAME)}!A2:F`);
-  if (rows.length > 0) {
+  const hasValidAccount = rows.some((row) => rowHasContent(row));
+  if (hasValidAccount) {
     return;
   }
 
   const now = formatBogotaDate();
   const passwordHash = hashPassword(DEFAULT_ADMIN_ACCOUNT.password);
 
-  await updateRangeValues(sheets, `${escapeSheetTitle(ADMIN_USERS_SHEET_NAME)}!A2`, [
-    [
-      DEFAULT_ADMIN_ACCOUNT.username,
-      DEFAULT_ADMIN_ACCOUNT.displayName,
-      DEFAULT_ADMIN_ACCOUNT.email,
-      passwordHash,
-      DEFAULT_ADMIN_ACCOUNT.aliases.join(','),
-      now,
-    ],
-  ]);
+  await saveAdminAccountRow(sheets, {
+    sheetRow: 2,
+    username: DEFAULT_ADMIN_ACCOUNT.username,
+    displayName: DEFAULT_ADMIN_ACCOUNT.displayName,
+    email: DEFAULT_ADMIN_ACCOUNT.email,
+    passwordHash,
+    aliases: DEFAULT_ADMIN_ACCOUNT.aliases,
+    updatedAt: now,
+  });
 }
 
 async function ensureDefaultStatuses(sheets) {
@@ -585,26 +594,39 @@ async function ensureDefaultStatuses(sheets) {
   );
 }
 
-async function readAdminAccount(runtime) {
+async function readAdminAccounts(runtime) {
   const rows = await getRangeValues(
     runtime.sheets,
     `${escapeSheetTitle(ADMIN_USERS_SHEET_NAME)}!A2:F`,
   );
 
-  if (rows.length === 0) {
+  const accounts = rows
+    .map((row, index) => parseAdminAccountRow(row, index + 2))
+    .filter(Boolean);
+
+  if (accounts.length === 0) {
     await ensureDefaultAdminAccount(runtime.sheets);
-    return readAdminAccount(runtime);
+    return readAdminAccounts(runtime);
   }
 
-  const [row] = rows;
-  return {
-    username: normalizeString(row[0]) || DEFAULT_ADMIN_ACCOUNT.username,
-    displayName: normalizeString(row[1]) || DEFAULT_ADMIN_ACCOUNT.displayName,
-    email: normalizeString(row[2]),
-    passwordHash: normalizeString(row[3]),
-    aliases: normalizeAliases(row[4]),
-    updatedAt: normalizeString(row[5]),
-  };
+  return accounts;
+}
+
+async function readAdminAccount(runtime, identity = '', options = {}) {
+  const accounts = await readAdminAccounts(runtime);
+  if (!identity) {
+    return accounts[0];
+  }
+
+  const account = findAdminAccountByIdentity(accounts, identity);
+  if (!account) {
+    if (options.throwIfMissing === false) {
+      return null;
+    }
+    throw createHttpError(401, 'Tu sesion expiro. Vuelve a iniciar sesion.');
+  }
+
+  return account;
 }
 
 async function loadStatuses(runtime) {
@@ -632,8 +654,8 @@ async function loadStatuses(runtime) {
   return loadStatuses(runtime);
 }
 
-async function loadBootstrapData(runtime) {
-  const profile = toProfile(await readAdminAccount(runtime));
+async function loadBootstrapData(runtime, identity) {
+  const profile = toProfile(await readAdminAccount(runtime, identity));
   const statuses = await loadStatuses(runtime);
   await normalizeRecordStatuses(runtime, statuses);
   const records = await loadRecords(runtime, statuses);
@@ -830,6 +852,10 @@ async function deleteRecord(runtime, sheetRow) {
   });
 }
 
+async function deleteAllRecords(runtime) {
+  await clearRange(runtime.sheets, `${escapeSheetTitle(config.responsesSheetName)}!A2:H`);
+}
+
 async function saveStatuses(runtime, incomingStatuses) {
   const previousStatuses = await loadStatuses(runtime);
   const normalizedStatuses = normalizeStatusesInput(incomingStatuses, previousStatuses);
@@ -851,14 +877,16 @@ async function saveStatuses(runtime, incomingStatuses) {
   return normalizedStatuses;
 }
 
-async function updateAdminAccount(runtime, input) {
-  const account = await readAdminAccount(runtime);
+async function updateAdminAccount(runtime, identity, input) {
+  const account = await readAdminAccount(runtime, identity);
+  const accounts = await readAdminAccounts(runtime);
   const username = normalizeString(input.username) || account.username;
   const displayName = normalizeString(input.displayName) || username;
   const email = normalizeString(input.email);
   const currentPassword = normalizeString(input.currentPassword);
   const newPassword = normalizeString(input.newPassword);
   const confirmPassword = normalizeString(input.confirmPassword);
+  const normalizedUsername = username.toLowerCase();
 
   if (username.length < 3) {
     throw createHttpError(400, 'El usuario debe tener al menos 3 caracteres.');
@@ -872,13 +900,28 @@ async function updateAdminAccount(runtime, input) {
     throw createHttpError(400, 'El correo no tiene un formato valido.');
   }
 
+  const usernameConflict = accounts.some((candidate) => {
+    if (candidate.sheetRow === account.sheetRow) {
+      return false;
+    }
+
+    return [candidate.username, ...(candidate.aliases || [])]
+      .map((value) => normalizeString(value).toLowerCase())
+      .filter(Boolean)
+      .includes(normalizedUsername);
+  });
+
+  if (usernameConflict) {
+    throw createHttpError(400, 'Ya existe otro administrador con ese usuario o alias.');
+  }
+
   let passwordHash = account.passwordHash;
   if (newPassword || confirmPassword) {
     if (!currentPassword) {
       throw createHttpError(400, 'Ingresa tu contrasena actual para cambiarla.');
     }
 
-    if (!verifyPassword(currentPassword, account.passwordHash)) {
+    if (!verifyStoredPassword(currentPassword, account.passwordHash).valid) {
       throw createHttpError(401, 'La contrasena actual no coincide.');
     }
 
@@ -894,24 +937,16 @@ async function updateAdminAccount(runtime, input) {
   }
 
   const updatedAccount = {
+    sheetRow: account.sheetRow,
     username,
     displayName,
     email,
     passwordHash,
-    aliases: [],
+    aliases: buildUpdatedAliases(account, username),
     updatedAt: formatBogotaDate(),
   };
 
-  await updateRangeValues(runtime.sheets, `${escapeSheetTitle(ADMIN_USERS_SHEET_NAME)}!A2`, [
-    [
-      updatedAccount.username,
-      updatedAccount.displayName,
-      updatedAccount.email,
-      updatedAccount.passwordHash,
-      '',
-      updatedAccount.updatedAt,
-    ],
-  ]);
+  await saveAdminAccountRow(runtime.sheets, updatedAccount);
 
   return updatedAccount;
 }
@@ -1069,6 +1104,66 @@ function recordToRow(record) {
   ];
 }
 
+function parseAdminAccountRow(row, sheetRow) {
+  if (!rowHasContent(row)) {
+    return null;
+  }
+
+  const username = normalizeString(row[0]) || DEFAULT_ADMIN_ACCOUNT.username;
+
+  return {
+    sheetRow,
+    username,
+    displayName: normalizeString(row[1]) || username || DEFAULT_ADMIN_ACCOUNT.displayName,
+    email: normalizeString(row[2]),
+    passwordHash: normalizeString(row[3]),
+    aliases: normalizeAliases(row[4]),
+    updatedAt: normalizeString(row[5]),
+  };
+}
+
+function rowHasContent(row) {
+  return Array.isArray(row) && row.some((value) => normalizeString(value));
+}
+
+function findAdminAccountByIdentity(accounts, identity) {
+  const normalizedIdentity = normalizeString(identity).toLowerCase();
+  if (!normalizedIdentity) {
+    return accounts[0] || null;
+  }
+
+  return accounts.find((account) =>
+    [account.username, ...(account.aliases || [])]
+      .map((value) => normalizeString(value).toLowerCase())
+      .filter(Boolean)
+      .includes(normalizedIdentity),
+  ) || null;
+}
+
+function buildUpdatedAliases(account, nextUsername) {
+  const aliases = new Set(
+    normalizeAliases([...(account.aliases || []), account.username].join(','))
+      .map((alias) => alias.toLowerCase()),
+  );
+  aliases.delete(normalizeString(nextUsername).toLowerCase());
+  return Array.from(aliases);
+}
+
+async function saveAdminAccountRow(sheets, account) {
+  await updateRangeValues(
+    sheets,
+    `${escapeSheetTitle(ADMIN_USERS_SHEET_NAME)}!A${account.sheetRow}`,
+    [[
+      account.username,
+      account.displayName,
+      account.email,
+      account.passwordHash,
+      (account.aliases || []).join(','),
+      account.updatedAt,
+    ]],
+  );
+}
+
 function toProfile(account) {
   return {
     username: account.username,
@@ -1211,6 +1306,28 @@ function verifyPassword(password, storedHash) {
   }
 
   return timingSafeEqual(derivedHash, storedBuffer);
+}
+
+function verifyStoredPassword(password, storedValue) {
+  const normalizedStoredValue = normalizeString(storedValue);
+  if (!normalizedStoredValue) {
+    return {
+      valid: false,
+      shouldUpgrade: false,
+    };
+  }
+
+  if (normalizedStoredValue.startsWith('pbkdf2$')) {
+    return {
+      valid: verifyPassword(password, normalizedStoredValue),
+      shouldUpgrade: false,
+    };
+  }
+
+  return {
+    valid: safeCompare(normalizeString(password), normalizedStoredValue),
+    shouldUpgrade: true,
+  };
 }
 
 async function readJsonBody(request) {

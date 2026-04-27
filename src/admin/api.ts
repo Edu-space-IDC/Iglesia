@@ -164,6 +164,16 @@ export async function deleteRecord(token: string, sheetRow: number) {
   );
 }
 
+export async function deleteAllRecords(token: string) {
+  return request<{ ok: true }>(
+    '/records',
+    {
+      method: 'DELETE',
+    },
+    token,
+  );
+}
+
 export async function saveStatuses(token: string, statuses: StatusOption[]) {
   return request<{ ok: true; statuses: StatusOption[] }>(
     '/statuses',
