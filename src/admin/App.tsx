@@ -789,7 +789,7 @@ export default function AdminApp() {
                 <span>{isLoggingIn ? 'Entrando...' : 'Entrar al dashboard'}</span>
               </button>
             </form>
-
+{/* 
             <div className="mt-8 rounded-[24px] border border-white/10 bg-black/10 p-5 text-sm leading-6 text-gray-200 shadow-sm">
               <p className="font-semibold text-white">Primer acceso automatico</p>
               <p className="mt-2">
@@ -803,7 +803,7 @@ export default function AdminApp() {
                 Apenas entres, en la pestana de cuenta puedes cambiar el nombre de acceso, el
                 nombre visible y la contrasena.
               </p>
-            </div>
+            </div> */}
           </PanelCard>
         </div>
 

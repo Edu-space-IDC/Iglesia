@@ -439,20 +439,20 @@ async function getRuntime() {
 async function createSheetsClient() {
   const serviceAccountFile = path.resolve(ROOT_DIR, config.googleServiceAccountFile);
   const hasServiceAccountFile = await fileExists(serviceAccountFile);
+  const envEmail = normalizeString(process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL);
+  const envPrivateKey = normalizePrivateKey(process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY);
+  const hasEnvCredentials = Boolean(envEmail) && Boolean(envPrivateKey);
 
-  const auth = hasServiceAccountFile
+  const auth = hasEnvCredentials
     ? new google.auth.GoogleAuth({
-        keyFile: serviceAccountFile,
+        credentials: {
+          client_email: envEmail,
+          private_key: envPrivateKey,
+        },
         scopes: ['https://www.googleapis.com/auth/spreadsheets'],
       })
     : new google.auth.GoogleAuth({
-        credentials: {
-          client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-          private_key: (process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY || '').replace(
-            /\\n/g,
-            '\n',
-          ),
-        },
+        keyFile: serviceAccountFile,
         scopes: ['https://www.googleapis.com/auth/spreadsheets'],
       });
 
@@ -1311,6 +1311,11 @@ function handleServerError(request, error) {
     return sendJson(request, 503, googleAccessErrorPayload);
   }
 
+  const googleCredentialErrorPayload = getGoogleCredentialErrorPayload(error);
+  if (googleCredentialErrorPayload) {
+    return sendJson(request, 503, googleCredentialErrorPayload);
+  }
+
   if (isGoogleQuotaError(error)) {
     return sendJson(request, 429, {
       ok: false,
@@ -1340,9 +1345,42 @@ function isGooglePermissionError(error) {
   return status === 403 || status === 404;
 }
 
+function isGoogleCredentialError(error) {
+  const status = error?.status || error?.code;
+  const googleError = normalizeString(error?.response?.data?.error).toLowerCase();
+  const description = normalizeString(
+    error?.response?.data?.error_description || error?.response?.data?.error?.message,
+  ).toLowerCase();
+
+  return status === 400 &&
+    googleError === 'invalid_grant' &&
+    /invalid jwt signature|invalid_grant/.test(description);
+}
+
 function isGoogleQuotaError(error) {
   const status = error?.status || error?.code;
   return status === 429;
+}
+
+function getGoogleCredentialErrorPayload(error) {
+  if (!isGoogleCredentialError(error)) {
+    return null;
+  }
+
+  return {
+    ok: false,
+    code: 'GOOGLE_SERVICE_ACCOUNT_INVALID',
+    message:
+      'No pudimos autenticar el service account de Google configurado en produccion.',
+    details: [
+      config.googleServiceAccountEmail
+        ? `Service account configurado: ${config.googleServiceAccountEmail}`
+        : '',
+      'La firma JWT no coincide con la clave privada.',
+      'Esto suele pasar cuando GOOGLE_SERVICE_ACCOUNT_EMAIL y GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY no pertenecen al mismo JSON, cuando la clave se pego con comillas extras o cuando la llave fue revocada y hay que generar una nueva.',
+      'En Vercel pega GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY completa, sin comillas envolventes. Puede ir multilínea o con \\n.',
+    ].filter(Boolean),
+  };
 }
 
 function getGoogleAccessErrorPayload(error) {
@@ -1435,6 +1473,19 @@ function requiredField(value, message) {
 
 function normalizeString(value) {
   return String(value || '').trim();
+}
+
+function normalizePrivateKey(value) {
+  let normalized = String(value || '').trim();
+
+  if (
+    (normalized.startsWith('"') && normalized.endsWith('"')) ||
+    (normalized.startsWith("'") && normalized.endsWith("'"))
+  ) {
+    normalized = normalized.slice(1, -1);
+  }
+
+  return normalized.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\\n/g, '\n');
 }
 
 function normalizeAliases(value) {
